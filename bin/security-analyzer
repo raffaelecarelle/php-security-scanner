@@ -1,0 +1,24 @@
+#!/usr/bin/env php
+<?php
+
+// Find and load the Composer autoloader
+$autoloadPaths = [
+    __DIR__ . '/../vendor/autoload.php',
+    __DIR__ . '/../../../autoload.php',
+];
+
+foreach ($autoloadPaths as $autoloadPath) {
+    if (file_exists($autoloadPath)) {
+        require_once $autoloadPath;
+        break;
+    }
+}
+
+use Security\CodeAnalyzer\Command\AnalyzeCommand;
+use Symfony\Component\Console\Application;
+
+// Create the application
+$application = new Application('PHP Security Code Analyzer', '1.0.0');
+$application->add(new AnalyzeCommand());
+$application->setDefaultCommand('analyze', true);
+$application->run();
