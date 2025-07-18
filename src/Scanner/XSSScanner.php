@@ -3,20 +3,18 @@
 namespace Security\CodeAnalyzer\Scanner;
 
 use PhpParser\Node;
-use PhpParser\Node\Expr\BinaryOp\Concat;
 use PhpParser\Node\Expr\FuncCall;
-use PhpParser\Node\Expr\Include_;
-use PhpParser\Node\Expr\Print_;
 use PhpParser\Node\Expr\Variable;
+use PhpParser\Node\Expr\Assign;
 use PhpParser\Node\Stmt\Echo_;
+use PhpParser\Node\Stmt\Expression;
 use PhpParser\NodeTraverser;
 use PhpParser\NodeVisitorAbstract;
+use PhpParser\Node\Expr\Print_;
+use PhpParser\Node\Expr\Include_;
 use Security\CodeAnalyzer\Vulnerability\VulnerabilityCollection;
 use Security\CodeAnalyzer\Vulnerability\XSSVulnerability;
 
-/**
- * Scanner for Cross-Site Scripting (XSS) vulnerabilities.
- */
 class XSSScanner extends AbstractScanner
 {
     /**
@@ -44,6 +42,7 @@ class XSSScanner extends AbstractScanner
             private string $code;
             private string $filePath;
             private VulnerabilityCollection $vulnerabilities;
+            private array $sanitizedVariables = [];
 
             // List of functions that escape output
             private array $safeFunctions = [
@@ -64,6 +63,11 @@ class XSSScanner extends AbstractScanner
 
             public function enterNode(Node $node)
             {
+                // Track sanitized variables
+                if ($node instanceof Expression && $node->expr instanceof Assign) {
+                    $this->trackSanitizedAssignment($node->expr);
+                }
+
                 // Check for echo statements
                 if ($node instanceof Echo_) {
                     foreach ($node->exprs as $expr) {
@@ -91,21 +95,33 @@ class XSSScanner extends AbstractScanner
                 return null;
             }
 
+            private function trackSanitizedAssignment(Assign $assign): void
+            {
+                if ($assign->var instanceof Variable && is_string($assign->var->name)) {
+                    $variableName = $assign->var->name;
+
+                    // Check if the assignment is a sanitization function call
+                    if ($assign->expr instanceof FuncCall && $assign->expr->name instanceof Node\Name) {
+                        $functionName = $assign->expr->name->toString();
+
+                        if (in_array($functionName, $this->safeFunctions)) {
+                            $this->sanitizedVariables[$variableName] = true;
+                        }
+                    }
+                }
+            }
+
             private function isVulnerableExpression(Node $node): bool
             {
-                // If it's a variable, it's potentially vulnerable
-                if ($node instanceof Variable) {
-                    return true;
+                // If it's a variable, check if it's sanitized
+                if ($node instanceof Variable && is_string($node->name)) {
+                    return !isset($this->sanitizedVariables[$node->name]);
                 }
 
-                // If it's a concatenation with a variable, it's potentially vulnerable
-                if ($node instanceof Concat) {
-                    if ($node->left instanceof Variable || $node->right instanceof Variable) {
-                        return true;
-                    }
-
+                // If it's a concatenation, check both sides
+                if ($node instanceof Node\Expr\BinaryOp\Concat) {
                     return $this->isVulnerableExpression($node->left) ||
-                           $this->isVulnerableExpression($node->right);
+                        $this->isVulnerableExpression($node->right);
                 }
 
                 // If it's a function call, check if it's a safe function

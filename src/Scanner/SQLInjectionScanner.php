@@ -3,18 +3,17 @@
 namespace Security\CodeAnalyzer\Scanner;
 
 use PhpParser\Node;
-use PhpParser\Node\Expr\BinaryOp\Concat;
-use PhpParser\Node\Expr\FuncCall;
 use PhpParser\Node\Expr\MethodCall;
+use PhpParser\Node\Expr\FuncCall;
+use PhpParser\Node\Expr\BinaryOp\Concat;
 use PhpParser\Node\Expr\Variable;
+use PhpParser\Node\Expr\Assign;
+use PhpParser\Node\Scalar\String_;
 use PhpParser\NodeTraverser;
 use PhpParser\NodeVisitorAbstract;
 use Security\CodeAnalyzer\Vulnerability\SQLInjectionVulnerability;
 use Security\CodeAnalyzer\Vulnerability\VulnerabilityCollection;
 
-/**
- * Scanner for SQL Injection vulnerabilities.
- */
 class SQLInjectionScanner extends AbstractScanner
 {
     /**
@@ -42,6 +41,7 @@ class SQLInjectionScanner extends AbstractScanner
             private string $code;
             private string $filePath;
             private VulnerabilityCollection $vulnerabilities;
+            private array $vulnerableVariables = [];
 
             public function __construct(string $code, string $filePath, VulnerabilityCollection $vulnerabilities)
             {
@@ -52,9 +52,22 @@ class SQLInjectionScanner extends AbstractScanner
 
             public function enterNode(Node $node)
             {
+                // Track variable assignments with concatenation
+                if ($node instanceof Assign) {
+                    if ($node->var instanceof Variable && isset($node->var->name)) {
+                        $varName = $node->var->name;
+                        if ($this->containsVariableConcatenation($node->expr)) {
+                            $this->vulnerableVariables[$varName] = $node;
+                        }
+                    }
+                }
+
                 // Check for direct query execution with concatenated variables
                 if ($node instanceof MethodCall) {
-                    $methodName = $node->name->name ?? null;
+                    $methodName = null;
+                    if (isset($node->name->name)) {
+                        $methodName = $node->name->name;
+                    }
 
                     // Check for common database query methods
                     if (in_array($methodName, ['query', 'exec', 'execute', 'rawQuery'])) {
@@ -63,6 +76,15 @@ class SQLInjectionScanner extends AbstractScanner
                             if ($this->containsVariableConcatenation($arg->value)) {
                                 $this->addVulnerability($node);
                                 break;
+                            }
+
+                            if ($arg->value instanceof Variable && isset($arg->value->name)) {
+                                // Check if the variable was assigned a concatenated value
+                                $varName = $arg->value->name;
+                                if (isset($this->vulnerableVariables[$varName])) {
+                                    $this->addVulnerabilityWithAssignment($node, $this->vulnerableVariables[$varName]);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -73,14 +95,20 @@ class SQLInjectionScanner extends AbstractScanner
                     $functionName = $node->name->toString();
 
                     if (in_array($functionName, ['mysqli_query', 'mysql_query', 'pg_query'])) {
-                        // For these functions, the SQL query is usually the second argument
-                        if (isset($node->args[1]) && $this->containsVariableConcatenation($node->args[1]->value)) {
-                            $this->addVulnerability($node);
-                        }
-                        // For mysql_query, the SQL query is the first argument
-                        elseif ($functionName === 'mysql_query' && isset($node->args[0]) &&
-                                $this->containsVariableConcatenation($node->args[0]->value)) {
-                            $this->addVulnerability($node);
+                        $queryArgIndex = ($functionName === 'mysqli_query') ? 1 : 0;
+
+                        if (isset($node->args[$queryArgIndex])) {
+                            $queryArg = $node->args[$queryArgIndex]->value;
+
+                            if ($this->containsVariableConcatenation($queryArg)) {
+                                $this->addVulnerability($node);
+                            } elseif ($queryArg instanceof Variable && isset($queryArg->name)) {
+                                // Check if the variable was assigned a concatenated value
+                                $varName = $queryArg->name;
+                                if (isset($this->vulnerableVariables[$varName])) {
+                                    $this->addVulnerabilityWithAssignment($node, $this->vulnerableVariables[$varName]);
+                                }
+                            }
                         }
                     }
                 }
@@ -91,12 +119,23 @@ class SQLInjectionScanner extends AbstractScanner
             private function containsVariableConcatenation(Node $node): bool
             {
                 if ($node instanceof Concat) {
-                    if ($node->left instanceof Variable || $node->right instanceof Variable) {
-                        return true;
-                    }
+                    // Check if either side is a variable or contains a variable
+                    return $this->hasVariable($node->left) || $this->hasVariable($node->right) ||
+                        $this->containsVariableConcatenation($node->left) ||
+                        $this->containsVariableConcatenation($node->right);
+                }
 
-                    return $this->containsVariableConcatenation($node->left) ||
-                           $this->containsVariableConcatenation($node->right);
+                return false;
+            }
+
+            private function hasVariable(Node $node): bool
+            {
+                if ($node instanceof Variable) {
+                    return true;
+                }
+
+                if ($node instanceof Concat) {
+                    return $this->hasVariable($node->left) || $this->hasVariable($node->right);
                 }
 
                 return false;
@@ -109,6 +148,29 @@ class SQLInjectionScanner extends AbstractScanner
 
                 // Extract the code snippet
                 $lines = explode("\n", $this->code);
+                $snippet = implode("\n", array_slice($lines, $startLine - 1, $endLine - $startLine + 1));
+
+                $vulnerability = new SQLInjectionVulnerability(
+                    $this->filePath,
+                    $startLine,
+                    $snippet,
+                    'high'
+                );
+
+                $this->vulnerabilities->add($vulnerability);
+            }
+
+            private function addVulnerabilityWithAssignment(Node $callNode, Node $assignNode): void
+            {
+                $assignStartLine = $assignNode->getStartLine();
+                $callStartLine = $callNode->getStartLine();
+                $callEndLine = $callNode->getEndLine();
+
+                // Extract the code snippet including both assignment and call
+                $lines = explode("\n", $this->code);
+                $startLine = min($assignStartLine, $callStartLine);
+                $endLine = max($assignStartLine, $callEndLine);
+
                 $snippet = implode("\n", array_slice($lines, $startLine - 1, $endLine - $startLine + 1));
 
                 $vulnerability = new SQLInjectionVulnerability(
